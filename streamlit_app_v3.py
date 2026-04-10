@@ -42,10 +42,12 @@ DEFAULT_CONFIG: dict = {
     # ── EMA per-timeframe ────────────────────────────────────────────────────
     "use_ema_3m":         False,
     "ema_period_3m":      200,
-    "use_ema_5m":         True,
+    "use_ema_5m":         False,
     "ema_period_5m":      200,
-    "use_ema_15m":        True,
+    "use_ema_15m":        False,
     "ema_period_15m":     200,
+    "use_ema_1h":         False,
+    "ema_period_1h":      200,
     # ── MACD ─────────────────────────────────────────────────────────────────
     "use_macd":           True,
     # ── Parabolic SAR ────────────────────────────────────────────────────────
@@ -442,7 +444,7 @@ def _reset_filter_counts():
     counts = {
         "checked": 0,
         "f4_rsi5m": 0, "f5_res5m": 0, "f6_res15m": 0, "f7_rsi1h": 0,
-        "f8_ema": 0,   "f9_macd": 0,   "f10_sar": 0,   "f11_vol": 0,
+        "f8_ema": 0,   "f9_macd": 0,  "f10_sar": 0,   "f11_vol": 0,
         "passed": 0,   "errors": 0,
     }
     with _filter_lock:
@@ -485,8 +487,12 @@ def process(sym: str, cfg: dict, max_leverage: str = "—"):
             return None
 
         # ── F7 — 1h RSI ──────────────────────────────────────────────────────
-        rsi1h = (calc_rsi_series(
-            [c["close"] for c in get_klines(sym, "1h", 19)[:-1]]) or [0.])[-1]
+        # Fetch enough 1h candles for RSI-14 (need ≥19) AND optional EMA
+        _1h_need   = max(19, int(cfg.get("ema_period_1h", 200)) + 10) \
+                     if cfg.get("use_ema_1h", False) else 19
+        m1h        = get_klines(sym, "1h", _1h_need + 1)[:-1]
+        closes_1h  = [c["close"] for c in m1h]
+        rsi1h      = (calc_rsi_series(closes_1h) or [0.])[-1]
         if not (cfg["rsi_1h_min"] <= rsi1h <= cfg["rsi_1h_max"]):
             with _filter_lock: _filter_counts["f7_rsi1h"] += 1
             return None
@@ -495,41 +501,25 @@ def process(sym: str, cfg: dict, max_leverage: str = "—"):
         m3_candles = get_klines(sym, "3m", 80)[:-1]
         closes_3m  = [c["close"] for c in m3_candles]
 
-        # ── F8 — EMA filter per timeframe ────────────────────────────────────
-        ema_results = {}   # {"3m": (enabled, period, price_above), ...}
-
-        if cfg.get("use_ema_3m", False):
-            p   = max(2, int(cfg.get("ema_period_3m", 200)))
-            ema = calc_ema(closes_3m, p)
-            ok  = bool(ema) and entry >= ema[-1]
-            ema_results["3m"] = (True, p, ok, ema[-1] if ema else 0.)
-            if not ok:
-                with _filter_lock: _filter_counts["f8_ema"] += 1
-                return None
-        else:
-            ema_results["3m"] = (False, int(cfg.get("ema_period_3m", 200)), None, 0.)
-
-        if cfg.get("use_ema_5m", True):
-            p   = max(2, int(cfg.get("ema_period_5m", 200)))
-            ema = calc_ema(closes_5m, p)
-            ok  = bool(ema) and entry >= ema[-1]
-            ema_results["5m"] = (True, p, ok, ema[-1] if ema else 0.)
-            if not ok:
-                with _filter_lock: _filter_counts["f8_ema"] += 1
-                return None
-        else:
-            ema_results["5m"] = (False, int(cfg.get("ema_period_5m", 200)), None, 0.)
-
-        if cfg.get("use_ema_15m", True):
-            p   = max(2, int(cfg.get("ema_period_15m", 200)))
-            ema = calc_ema(closes_15m, p)
-            ok  = bool(ema) and entry >= ema[-1]
-            ema_results["15m"] = (True, p, ok, ema[-1] if ema else 0.)
-            if not ok:
-                with _filter_lock: _filter_counts["f8_ema"] += 1
-                return None
-        else:
-            ema_results["15m"] = (False, int(cfg.get("ema_period_15m", 200)), None, 0.)
+        # ── F8 — EMA filter (price above EMA, per enabled timeframe) ──────────
+        _ema_checks = [
+            ("3m",  cfg.get("use_ema_3m",  False), cfg.get("ema_period_3m",  200), closes_3m),
+            ("5m",  cfg.get("use_ema_5m",  False), cfg.get("ema_period_5m",  200), closes_5m),
+            ("15m", cfg.get("use_ema_15m", False), cfg.get("ema_period_15m", 200), closes_15m),
+            ("1h",  cfg.get("use_ema_1h",  False), cfg.get("ema_period_1h",  200), closes_1h),
+        ]
+        ema_detail = {}   # {"3m": (enabled, period, above_bool, ema_val), ...}
+        for _tf, _enabled, _period, _closes in _ema_checks:
+            if _enabled:
+                _p   = max(2, int(_period))
+                _ema = calc_ema(_closes, _p)
+                _ok  = bool(_ema) and entry >= _ema[-1]
+                ema_detail[_tf] = (True, _p, _ok, _ema[-1] if _ema else 0.)
+                if not _ok:
+                    with _filter_lock: _filter_counts["f8_ema"] += 1
+                    return None
+            else:
+                ema_detail[_tf] = (False, int(_period), None, 0.)
 
         # ── F9 — MACD bullish (3m, 5m, 15m) ──────────────────────────────────
         macd_3m  = macd_bullish_detail(closes_3m)
@@ -583,11 +573,11 @@ def process(sym: str, cfg: dict, max_leverage: str = "—"):
         c_rsi = f"RSI5m:{rsi5:.1f} RSI1h:{rsi1h:.1f}"
 
         # EMA status per enabled timeframe
-        ema_parts = []
-        for tf, (enabled, period, above, val) in ema_results.items():
-            if enabled:
-                ema_parts.append(f"EMA{period}/{tf}:{'✅' if above else '❌'}({val:.4g})")
-        c_ema = " ".join(ema_parts) if ema_parts else ""
+        _ema_parts = []
+        for _tf, (_en, _p, _ok, _val) in ema_detail.items():
+            if _en:
+                _ema_parts.append(f"EMA{_p}/{_tf}:{'✅' if _ok else '❌'}({_val:.5g})")
+        c_ema = " ".join(_ema_parts)
 
         # MACD status
         def _macd_tag(d): return f"{'✅' if d['ok'] else '❌'}(M:{d['macd']:.4g} H:{d['histogram']:.4g})"
@@ -720,6 +710,11 @@ def _ensure_scanner():
         _b._bsc_thread = t
 
 # ─────────────────────────────────────────────────────────────────────────────
+# UAE timezone (UTC +4:00 — no DST)
+# ─────────────────────────────────────────────────────────────────────────────
+_UAE_TZ = timezone(timedelta(hours=4))
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Utility: format progress toward TP / SL for open orders
 # ─────────────────────────────────────────────────────────────────────────────
 def _progress_str(sig: dict) -> str:
@@ -750,13 +745,14 @@ def _progress_str(sig: dict) -> str:
     direction  = "📈" if pct >= 0 else "📉"
     return f"{direction} {pct:+.1f}%"
 
-def _format_ts(iso_str: str | None) -> str:
-    """Format ISO timestamp to MM/DD HH:MM, returns '—' for None."""
+def _format_ts(iso_str) -> str:
+    """Format ISO timestamp to MM/DD HH:MM in UAE time (UTC+4). Returns '—' for None."""
     if not iso_str:
         return "—"
     try:
-        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-        return dt.strftime("%m/%d %H:%M")
+        dt     = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        dt_uae = dt.astimezone(_UAE_TZ)
+        return dt_uae.strftime("%m/%d %H:%M")
     except Exception:
         return iso_str[:16] if iso_str else "—"
 
@@ -826,40 +822,43 @@ with st.sidebar:
     st.divider()
 
     # ── EMA Filter — per timeframe ────────────────────────────────────────────
-    st.markdown("**📉 F8 — EMA Filter** (price above EMA, per timeframe)")
+    st.markdown("**📉 F8 — EMA Filter** (price must be above EMA)")
+    st.caption("Enable each timeframe independently and set its EMA period.")
 
-    ea1, ea2 = st.columns([1, 2])
-    new_use_ema_3m = ea1.checkbox("3m EMA", value=bool(_snap_cfg.get("use_ema_3m", False)),
-                                   key="cfg_use_ema_3m",
-                                   help="Price must be above EMA on the 3-minute chart.")
-    new_ema_period_3m = ea2.number_input(
-        "3m period", min_value=2, max_value=500, step=1,
-        value=int(_snap_cfg.get("ema_period_3m", 200)),
-        key="cfg_ema_period_3m", disabled=not new_use_ema_3m,
-        label_visibility="collapsed")
-    if new_use_ema_3m: ea2.caption(f"3m EMA {new_ema_period_3m}")
+    for _tf_label, _key_use, _key_per, _default_on in [
+        ("3m",  "cfg_use_ema_3m",  "cfg_ema_per_3m",  "use_ema_3m"),
+        ("5m",  "cfg_use_ema_5m",  "cfg_ema_per_5m",  "use_ema_5m"),
+        ("15m", "cfg_use_ema_15m", "cfg_ema_per_15m", "use_ema_15m"),
+        ("60m", "cfg_use_ema_1h",  "cfg_ema_per_1h",  "use_ema_1h"),
+    ]:
+        _cfg_period_key = f"ema_period_{_tf_label.replace('60m','1h')}"
+        _col_cb, _col_in = st.columns([1, 2])
+        _cb = _col_cb.checkbox(
+            f"{_tf_label} EMA",
+            value=bool(_snap_cfg.get(_default_on, False)),
+            key=_key_use,
+            help=f"Price must be above the EMA on the {_tf_label} chart.",
+        )
+        _per = _col_in.number_input(
+            f"Period##{_tf_label}",
+            min_value=2, max_value=500, step=1,
+            value=int(_snap_cfg.get(_cfg_period_key, 200)),
+            key=_key_per,
+            disabled=not _cb,
+            label_visibility="collapsed",
+        )
+        if _cb:
+            _col_in.caption(f"{_tf_label} EMA {_per}")
 
-    eb1, eb2 = st.columns([1, 2])
-    new_use_ema_5m = eb1.checkbox("5m EMA", value=bool(_snap_cfg.get("use_ema_5m", True)),
-                                   key="cfg_use_ema_5m",
-                                   help="Price must be above EMA on the 5-minute chart.")
-    new_ema_period_5m = eb2.number_input(
-        "5m period", min_value=2, max_value=500, step=1,
-        value=int(_snap_cfg.get("ema_period_5m", 200)),
-        key="cfg_ema_period_5m", disabled=not new_use_ema_5m,
-        label_visibility="collapsed")
-    if new_use_ema_5m: eb2.caption(f"5m EMA {new_ema_period_5m}")
-
-    ec1, ec2 = st.columns([1, 2])
-    new_use_ema_15m = ec1.checkbox("15m EMA", value=bool(_snap_cfg.get("use_ema_15m", True)),
-                                    key="cfg_use_ema_15m",
-                                    help="Price must be above EMA on the 15-minute chart.")
-    new_ema_period_15m = ec2.number_input(
-        "15m period", min_value=2, max_value=500, step=1,
-        value=int(_snap_cfg.get("ema_period_15m", 200)),
-        key="cfg_ema_period_15m", disabled=not new_use_ema_15m,
-        label_visibility="collapsed")
-    if new_use_ema_15m: ec2.caption(f"15m EMA {new_ema_period_15m}")
+    # resolve widget values for use in Save button
+    new_use_ema_3m     = st.session_state.get("cfg_use_ema_3m",  False)
+    new_ema_period_3m  = st.session_state.get("cfg_ema_per_3m",  200)
+    new_use_ema_5m     = st.session_state.get("cfg_use_ema_5m",  False)
+    new_ema_period_5m  = st.session_state.get("cfg_ema_per_5m",  200)
+    new_use_ema_15m    = st.session_state.get("cfg_use_ema_15m", False)
+    new_ema_period_15m = st.session_state.get("cfg_ema_per_15m", 200)
+    new_use_ema_1h     = st.session_state.get("cfg_use_ema_1h",  False)
+    new_ema_period_1h  = st.session_state.get("cfg_ema_per_1h",  200)
 
     st.divider()
 
@@ -997,6 +996,8 @@ with st.sidebar:
             "ema_period_5m":      int(new_ema_period_5m),
             "use_ema_15m":        bool(new_use_ema_15m),
             "ema_period_15m":     int(new_ema_period_15m),
+            "use_ema_1h":         bool(new_use_ema_1h),
+            "ema_period_1h":      int(new_ema_period_1h),
             "use_macd":           bool(new_use_macd),
             "use_sar":            bool(new_use_sar),
             "use_vol_spike":      bool(new_use_vol_spike),
@@ -1025,7 +1026,7 @@ if last_scan and last_scan != "never":
         pass
 
 col_h1, col_h2 = st.columns([3, 1])
-col_h1.caption(f"Last scan: {last_scan}   |   Auto-refreshes every 30 s")
+col_h1.caption(f"Last scan: {last_scan}   |   All times shown in UAE (UTC+4)   |   Auto-refreshes every 30 s")
 if col_h2.button("🔄 Refresh now", key="manual_refresh"):
     st.rerun()
 
@@ -1050,10 +1051,11 @@ st.divider()
 # ── Active filters badge row ──────────────────────────────────────────────────
 st.markdown("**Active Filters:**")
 badges = []
-if _snap_cfg.get("use_ema_3m"):    badges.append(f"📉 EMA{_snap_cfg.get('ema_period_3m',200)} 3m")
-if _snap_cfg.get("use_ema_5m"):    badges.append(f"📉 EMA{_snap_cfg.get('ema_period_5m',200)} 5m")
-if _snap_cfg.get("use_ema_15m"):   badges.append(f"📉 EMA{_snap_cfg.get('ema_period_15m',200)} 15m")
-if _snap_cfg.get("use_macd"):      badges.append("📊 MACD 3m·5m·15m")
+if _snap_cfg.get("use_ema_3m"):  badges.append(f"📉 EMA{_snap_cfg.get('ema_period_3m',200)} 3m")
+if _snap_cfg.get("use_ema_5m"):  badges.append(f"📉 EMA{_snap_cfg.get('ema_period_5m',200)} 5m")
+if _snap_cfg.get("use_ema_15m"): badges.append(f"📉 EMA{_snap_cfg.get('ema_period_15m',200)} 15m")
+if _snap_cfg.get("use_ema_1h"):  badges.append(f"📉 EMA{_snap_cfg.get('ema_period_1h',200)} 60m")
+if _snap_cfg.get("use_macd"):    badges.append("📊 MACD 3m·5m·15m")
 if _snap_cfg.get("use_sar"):       badges.append("🪂 SAR 3m·5m·15m")
 if _snap_cfg.get("use_vol_spike"): badges.append(
     f"📦 Vol5m ≥{_snap_cfg.get('vol_spike_mult',2.0)}× / {_snap_cfg.get('vol_spike_lookback',20)} candles")
@@ -1100,14 +1102,14 @@ if filtered_sorted:
         leverage = s.get("max_leverage", "—")
 
         rows.append({
-            "Time":       _format_ts(s.get("timestamp")),
+            "Time (UAE)":  _format_ts(s.get("timestamp")),
             "Symbol":     s.get("symbol", ""),
             "Sector":     s.get("sector", "Other"),
             "Entry":      s.get("entry", ""),
             "TP":         s.get("tp", ""),
             "SL":         s.get("sl", ""),
             "Status":     status_icon,
-            "Close Time": close_ts,
+            "Close (UAE)": close_ts,
             "Close $":    s.get("close_price") or "—",
             "Progress":   progress,
             "Max Lev":    leverage,
@@ -1128,8 +1130,8 @@ if filtered_sorted:
             "Criteria":   st.column_config.TextColumn(
                 width="large",
                 help="Filter values at signal time: RSI, EMA, MACD, SAR, Volume"),
-            "Close Time": st.column_config.TextColumn(
-                help="Timestamp when TP or SL was hit"),
+            "Close (UAE)": st.column_config.TextColumn(
+                help="UAE time (UTC+4) when TP or SL was hit"),
         },
     )
 else:
@@ -1203,12 +1205,13 @@ if fc.get("checked", 0) > 0:
         after_f9  = after_f8 - f9
         after_f10 = after_f9 - f10
 
-        # Dynamic labels
-        ema_parts = []
-        if _snap_cfg.get("use_ema_3m"):  ema_parts.append(f"3m/{_snap_cfg.get('ema_period_3m',200)}")
-        if _snap_cfg.get("use_ema_5m"):  ema_parts.append(f"5m/{_snap_cfg.get('ema_period_5m',200)}")
-        if _snap_cfg.get("use_ema_15m"): ema_parts.append(f"15m/{_snap_cfg.get('ema_period_15m',200)}")
-        ema_lbl  = f"After F8 EMA ({', '.join(ema_parts)})" if ema_parts else "F8 EMA (off)"
+        # F8 label — list enabled timeframes
+        _ema_active = []
+        if _snap_cfg.get("use_ema_3m"):  _ema_active.append(f"3m/{_snap_cfg.get('ema_period_3m',200)}")
+        if _snap_cfg.get("use_ema_5m"):  _ema_active.append(f"5m/{_snap_cfg.get('ema_period_5m',200)}")
+        if _snap_cfg.get("use_ema_15m"): _ema_active.append(f"15m/{_snap_cfg.get('ema_period_15m',200)}")
+        if _snap_cfg.get("use_ema_1h"):  _ema_active.append(f"60m/{_snap_cfg.get('ema_period_1h',200)}")
+        ema_lbl  = f"After F8 EMA ({', '.join(_ema_active)})" if _ema_active else "F8 EMA (all off)"
         macd_lbl = "After F9 MACD 3m·5m·15m" if _snap_cfg.get("use_macd") else "F9 MACD (off)"
         sar_lbl  = "After F10 SAR 3m·5m·15m"  if _snap_cfg.get("use_sar")  else "F10 SAR (off)"
         vol_lbl  = (f"After F11 Vol5m ≥{_snap_cfg.get('vol_spike_mult',2.0)}×"
