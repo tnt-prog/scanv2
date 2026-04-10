@@ -719,10 +719,9 @@ _UAE_TZ = timezone(timedelta(hours=4))
 # ─────────────────────────────────────────────────────────────────────────────
 def _progress_str(sig: dict) -> str:
     """
-    For open signals: percentage progress from entry toward TP.
-    Negative % means price moved toward SL instead.
-    e.g.  +45%  means halfway to TP
-          -30%  means moved 30% of the distance toward SL
+    For open signals: percentage progress toward TP (positive) or SL (negative).
+    Uses separate denominators so +100% = at TP and -100% = at SL, regardless
+    of whether TP and SL distances are equal.
     """
     if sig.get("status") != "open":
         return "—"
@@ -731,18 +730,21 @@ def _progress_str(sig: dict) -> str:
     sl     = sig.get("sl",    0.)
     latest = sig.get("latest_price") or entry
 
-    tp_dist = tp - entry   # positive distance to TP
-    sl_dist = entry - sl   # positive distance to SL
+    tp_dist = tp - entry    # positive distance to TP
+    sl_dist = entry - sl    # positive distance to SL
     move    = latest - entry
 
-    if tp_dist <= 0:
+    if tp_dist <= 0 or sl_dist <= 0:
         return "—"
 
-    pct = (move / tp_dist) * 100   # +100 = at TP, negative = going down
-    # Show both direction and absolute amount
-    bar_filled = max(0, min(int(pct / 5), 20))   # 0-20 filled blocks
-    bar_empty  = 20 - bar_filled
-    direction  = "📈" if pct >= 0 else "📉"
+    if move >= 0:
+        # Moving toward TP — express as % of TP distance, capped at +100%
+        pct = min((move / tp_dist) * 100, 100.0)
+    else:
+        # Moving toward SL — express as % of SL distance, capped at -100%
+        pct = max((move / sl_dist) * 100, -100.0)
+
+    direction = "📈" if pct >= 0 else "📉"
     return f"{direction} {pct:+.1f}%"
 
 def _format_ts(iso_str) -> str:
